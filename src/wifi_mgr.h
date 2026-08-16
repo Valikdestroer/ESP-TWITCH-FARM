@@ -12,12 +12,16 @@ public:
     static void startAP();
     static void processDNS();
     static bool isConnected();
+    static void notifyNetworkError();
+    static void checkConnection();
     static String scanNetworksJson();
     static String getIP();
 
 private:
     static DNSServer dnsServer;
     static bool isAPMode;
+    static uint8_t consecutiveErrors;
+    static uint32_t lastReconnectAttempt;
 };
 
 #endif // WIFI_MGR_H

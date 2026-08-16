@@ -33,6 +33,18 @@ static void loadGameQueue(AppConfig& config, const String& jsonStr) {
         entry.status = (GameStatus)(obj["s"].as<uint8_t>());
         entry.progress_pct = obj["pct"] | 0;
         entry.minutes_watched = obj["mw"] | 0;
+        
+        entry.streamer_count = 0;
+        JsonArray stArr = obj["st"].as<JsonArray>();
+        for (const char* stName : stArr) {
+            if (entry.streamer_count >= MAX_PREFERRED_STREAMERS) break;
+            if (stName && strlen(stName) > 0) {
+                strncpy(entry.preferred_streamers[entry.streamer_count], stName, sizeof(entry.preferred_streamers[0]) - 1);
+                entry.preferred_streamers[entry.streamer_count][sizeof(entry.preferred_streamers[0]) - 1] = '\0';
+                entry.streamer_count++;
+            }
+        }
+
         if (strlen(entry.name) > 0) {
             config.game_queue_count++;
         }
@@ -53,6 +65,70 @@ static String serializeGameQueue(const AppConfig& config) {
         obj["s"] = (uint8_t)e.status;
         obj["pct"] = e.progress_pct;
         obj["mw"] = e.minutes_watched;
+        if (e.streamer_count > 0) {
+            JsonArray stArr = obj["st"].to<JsonArray>();
+            for (uint8_t s = 0; s < e.streamer_count; s++) {
+                stArr.add(e.preferred_streamers[s]);
+            }
+        }
+    }
+
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+// Deserialize multi-account profiles from NVS JSON string
+static void loadAccounts(AppConfig& config, const String& jsonStr) {
+    config.account_count = 0;
+    if (jsonStr.length() == 0) return;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, jsonStr);
+    if (err) return;
+
+    JsonArray arr = doc.as<JsonArray>();
+    for (JsonObject obj : arr) {
+        if (config.account_count >= MAX_ACCOUNTS) break;
+        AccountProfile& acc = config.accounts[config.account_count];
+        strncpy(acc.name, obj["n"] | "", sizeof(acc.name) - 1);
+        acc.name[sizeof(acc.name) - 1] = '\0';
+        strncpy(acc.oauth_token, obj["t"] | "", sizeof(acc.oauth_token) - 1);
+        acc.oauth_token[sizeof(acc.oauth_token) - 1] = '\0';
+        strncpy(acc.user_id, obj["uid"] | "", sizeof(acc.user_id) - 1);
+        acc.user_id[sizeof(acc.user_id) - 1] = '\0';
+        strncpy(acc.user_login, obj["ul"] | "", sizeof(acc.user_login) - 1);
+        acc.user_login[sizeof(acc.user_login) - 1] = '\0';
+        strncpy(acc.device_id, obj["did"] | "", sizeof(acc.device_id) - 1);
+        acc.device_id[sizeof(acc.device_id) - 1] = '\0';
+        acc.enabled = obj["en"] | true;
+        acc.total_minutes = obj["tm"] | 0;
+        acc.drops_claimed = obj["dc"] | 0;
+        acc.points_claimed = obj["pc"] | 0;
+        if (strlen(acc.oauth_token) > 0) {
+            config.account_count++;
+        }
+    }
+}
+
+// Serialize multi-account profiles to compact JSON string
+static String serializeAccounts(const AppConfig& config) {
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+
+    for (uint8_t i = 0; i < config.account_count; i++) {
+        const AccountProfile& acc = config.accounts[i];
+        if (strlen(acc.oauth_token) == 0) continue;
+        JsonObject obj = arr.add<JsonObject>();
+        obj["n"] = acc.name;
+        obj["t"] = acc.oauth_token;
+        obj["uid"] = acc.user_id;
+        obj["ul"] = acc.user_login;
+        obj["did"] = acc.device_id;
+        obj["en"] = acc.enabled;
+        obj["tm"] = acc.total_minutes;
+        obj["dc"] = acc.drops_claimed;
+        obj["pc"] = acc.points_claimed;
     }
 
     String output;
@@ -63,7 +139,6 @@ static String serializeGameQueue(const AppConfig& config) {
 bool StorageManager::loadConfig(AppConfig& config) {
     if (!prefs.begin(NVS_NAMESPACE, true)) { // Read-only mode
         Logger::warn("NVS namespace not found or empty. Using default settings.");
-        // Set defaults
         strncpy(config.wifi_ssid, "", sizeof(config.wifi_ssid));
         strncpy(config.wifi_pass, "", sizeof(config.wifi_pass));
         strncpy(config.oauth_token, "", sizeof(config.oauth_token));
@@ -71,9 +146,14 @@ bool StorageManager::loadConfig(AppConfig& config) {
         strncpy(config.target_game, "", sizeof(config.target_game));
         strncpy(config.target_channel, "", sizeof(config.target_channel));
         config.auto_claim = true;
+        config.auto_claim_points = true;
+        config.led_enabled = true;
         config.check_interval_sec = 60;
         config.farming_enabled = true;
         config.game_queue_count = 0;
+        config.account_count = 0;
+        config.active_account_idx = 0;
+        config.account_rotation_enabled = false;
         return false;
     }
 
@@ -84,9 +164,14 @@ bool StorageManager::loadConfig(AppConfig& config) {
     String game = prefs.getString("game", "");
     String channel = prefs.getString("channel", "");
     bool autoClaim = prefs.getBool("auto_claim", true);
+    bool autoPoints = prefs.getBool("auto_pts", true);
+    bool ledOn = prefs.getBool("led_on", true);
     uint16_t interval = prefs.getUShort("interval", 60);
     bool enabled = prefs.getBool("enabled", true);
     String gamesJson = prefs.getString("games_q", "");
+    String accountsJson = prefs.getString("acc_q", "");
+    uint8_t activeAcc = prefs.getUChar("act_acc", 0);
+    bool accRot = prefs.getBool("acc_rot", false);
 
     prefs.end();
 
@@ -97,11 +182,31 @@ bool StorageManager::loadConfig(AppConfig& config) {
     strncpy(config.target_game, game.c_str(), sizeof(config.target_game));
     strncpy(config.target_channel, channel.c_str(), sizeof(config.target_channel));
     config.auto_claim = autoClaim;
+    config.auto_claim_points = autoPoints;
+    config.led_enabled = ledOn;
     config.check_interval_sec = interval;
     config.farming_enabled = enabled;
+    config.active_account_idx = activeAcc;
+    config.account_rotation_enabled = accRot;
 
     // Load priority game queue
     loadGameQueue(config, gamesJson);
+
+    // Load multi-accounts
+    loadAccounts(config, accountsJson);
+
+    // If main token is set but no account profile exists, auto-populate Main account profile
+    if (config.account_count == 0 && strlen(config.oauth_token) > 0) {
+        AccountProfile& acc = config.accounts[0];
+        strncpy(acc.name, "Main", sizeof(acc.name));
+        strncpy(acc.oauth_token, config.oauth_token, sizeof(acc.oauth_token));
+        acc.enabled = true;
+        acc.total_minutes = 0;
+        acc.drops_claimed = 0;
+        acc.points_claimed = 0;
+        config.account_count = 1;
+        config.active_account_idx = 0;
+    }
 
     // Backward migration: if no queue exists but old single game is set, create 1-entry queue
     if (config.game_queue_count == 0 && strlen(config.target_game) > 0) {
@@ -112,13 +217,14 @@ bool StorageManager::loadConfig(AppConfig& config) {
         entry.status = GAME_QUEUED;
         entry.progress_pct = 0;
         entry.minutes_watched = 0;
+        entry.streamer_count = 0;
         config.game_queue_count = 1;
-        Logger::info("Migrated single game '%s' to priority queue", config.target_game);
     }
 
-    Logger::info("Config loaded from NVS. Target Game: %s, Queue: %d games, Wi-Fi: %s",
+    Logger::info("Config loaded from NVS. Target Game: %s, Queue: %d games, Accounts: %d, Wi-Fi: %s",
         config.target_game[0] ? config.target_game : "<auto>",
         config.game_queue_count,
+        config.account_count,
         config.wifi_ssid[0] ? config.wifi_ssid : "<not set>");
     return true;
 }
@@ -136,12 +242,20 @@ bool StorageManager::saveConfig(const AppConfig& config) {
     prefs.putString("game", config.target_game);
     prefs.putString("channel", config.target_channel);
     prefs.putBool("auto_claim", config.auto_claim);
+    prefs.putBool("auto_pts", config.auto_claim_points);
+    prefs.putBool("led_on", config.led_enabled);
     prefs.putUShort("interval", config.check_interval_sec);
     prefs.putBool("enabled", config.farming_enabled);
+    prefs.putUChar("act_acc", config.active_account_idx);
+    prefs.putBool("acc_rot", config.account_rotation_enabled);
 
     // Serialize and save game queue
     String gamesJson = serializeGameQueue(config);
     prefs.putString("games_q", gamesJson);
+
+    // Serialize and save accounts
+    String accountsJson = serializeAccounts(config);
+    prefs.putString("acc_q", accountsJson);
 
     prefs.end();
     Logger::info("Config successfully saved to NVS.");
@@ -155,4 +269,3 @@ void StorageManager::resetConfig() {
         Logger::info("NVS storage cleared.");
     }
 }
-

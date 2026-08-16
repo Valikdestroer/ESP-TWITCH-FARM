@@ -11,7 +11,7 @@ public:
     static void printStatus();
 
 private:
-    static void handleCommand(String cmd);
+    static void handleCommand(const String& cmd);
 };
 
 #endif // CLI_MENU_H

@@ -1,6 +1,8 @@
 #include "twitch_api.h"
 #include "logger.h"
 #include "storage.h"
+#include "wifi_mgr.h"
+#include "led_indicator.h"
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -697,112 +699,161 @@ bool TwitchAPI::fetchInventoryAndProgress() {
     return true;
 }
 
+bool TwitchAPI::checkStreamerLive(const char* streamerLogin, const char* expectedGame, String& outChannelId, String& outBroadcastId) {
+    if (!streamerLogin || strlen(streamerLogin) == 0) return false;
+
+    String payload = "[{\"operationName\":\"StreamMetadata\",\"query\":\"query StreamMetadata($channelLogin: String!) { user(login: $channelLogin) { id broadcastSettings { title game { id name } } stream { id type } } }\",\"variables\":{\"channelLogin\":\"";
+    payload += streamerLogin;
+    payload += "\"}}]";
+
+    String response = sendGraphQLRequest(payload);
+    if (response.length() == 0) return false;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, response)) return false;
+
+    JsonObject user = doc[0]["data"]["user"];
+    if (user.isNull()) return false;
+
+    const char* uid = user["id"] | "";
+    JsonObject stream = user["stream"];
+    if (stream.isNull()) {
+        Logger::info("Preferred streamer '%s' is currently offline.", streamerLogin);
+        return false;
+    }
+
+    const char* streamType = stream["type"] | "";
+    const char* bId = stream["id"] | "";
+    const char* gName = user["broadcastSettings"]["game"]["name"] | "";
+
+    if (strcmp(streamType, "live") == 0) {
+        if (expectedGame && strlen(expectedGame) > 0) {
+            if (strcasestr(gName, expectedGame) == NULL && strcasestr(expectedGame, gName) == NULL) {
+                Logger::info("Preferred streamer '%s' is live, but playing '%s' (expected '%s')", streamerLogin, gName, expectedGame);
+                return false;
+            }
+        }
+        outChannelId = uid;
+        outBroadcastId = bId;
+        Logger::info("Preferred streamer '%s' is LIVE playing '%s'! (Channel ID: %s, Broadcast: %s)", streamerLogin, gName, uid, bId);
+        return true;
+    }
+    return false;
+}
+
 bool TwitchAPI::findLiveStreamForGame(const char* gameName) {
     if (g_config.target_channel[0] != '\0') {
         snprintf(g_state.current_channel, sizeof(g_state.current_channel), "%s", g_config.target_channel);
         Logger::info("Using specified target streamer: %s", g_state.current_channel);
-    } else {
-        const char* searchGame = (g_config.target_game[0] != '\0') ? g_config.target_game : ((g_state.current_game[0] != '\0') ? g_state.current_game : gameName);
-        Logger::info("Searching top Drops-enabled stream for game: %s ...", searchGame);
-        
-        String payload = "[{\"operationName\":\"DirectoryPage_Game\",\"query\":\"query DirectoryPage_Game($name: String!) { game(name: $name) { id streams(first: 15) { edges { node { id freeformTags { name } broadcaster { id login } } } } } }\",\"variables\":{\"name\":\"";
-        payload += searchGame;
-        payload += "\"}}]";
+        String chId, bcId;
+        if (checkStreamerLive(g_state.current_channel, NULL, chId, bcId)) {
+            strncpy(g_state.current_channel_id, chId.c_str(), sizeof(g_state.current_channel_id));
+            strncpy(g_state.current_broadcast_id, bcId.c_str(), sizeof(g_state.current_broadcast_id));
+            return true;
+        }
+    }
 
-        String response = sendGraphQLRequest(payload);
-        if (response.length() > 0) {
-            JsonDocument doc;
-            if (!deserializeJson(doc, response)) {
-                JsonArray edges = doc[0]["data"]["game"]["streams"]["edges"].as<JsonArray>();
-                if (edges.size() > 0) {
-                    JsonObject selectedNode;
-                    bool streamerFound = false;
+    const char* searchGame = (g_config.target_game[0] != '\0') ? g_config.target_game : ((g_state.current_game[0] != '\0') ? g_state.current_game : gameName);
 
-                    // 1. First priority: look for a live stream with "drop" tag that is NOT in the failed blacklist
+    // 1. Check if current game in queue has preferred streamers (Whitelist)
+    for (uint8_t i = 0; i < g_config.game_queue_count; i++) {
+        GameEntry& entry = g_config.game_queue[i];
+        if (strcasecmp(entry.name, searchGame) == 0 && entry.streamer_count > 0) {
+            Logger::info("Checking %d preferred streamer(s) for '%s'...", entry.streamer_count, searchGame);
+            for (uint8_t s = 0; s < entry.streamer_count; s++) {
+                const char* prefStreamer = entry.preferred_streamers[s];
+                if (strlen(prefStreamer) == 0 || isStreamerFailed(prefStreamer)) continue;
+
+                String chId, bcId;
+                if (checkStreamerLive(prefStreamer, searchGame, chId, bcId)) {
+                    strncpy(g_state.current_channel, prefStreamer, sizeof(g_state.current_channel));
+                    strncpy(g_state.current_channel_id, chId.c_str(), sizeof(g_state.current_channel_id));
+                    strncpy(g_state.current_broadcast_id, bcId.c_str(), sizeof(g_state.current_broadcast_id));
+                    Logger::info("Selected preferred streamer '%s' for '%s'!", prefStreamer, searchGame);
+                    return true;
+                }
+            }
+            Logger::info("All preferred streamers for '%s' are offline/unavailable. Falling back to auto-search...", searchGame);
+            break;
+        }
+    }
+
+    Logger::info("Searching top Drops-enabled stream for game: %s ...", searchGame);
+    
+    String payload = "[{\"operationName\":\"DirectoryPage_Game\",\"query\":\"query DirectoryPage_Game($name: String!) { game(name: $name) { id streams(first: 15) { edges { node { id freeformTags { name } broadcaster { id login } } } } } }\",\"variables\":{\"name\":\"";
+    payload += searchGame;
+    payload += "\"}}]";
+
+    String response = sendGraphQLRequest(payload);
+    if (response.length() > 0) {
+        JsonDocument doc;
+        if (!deserializeJson(doc, response)) {
+            JsonArray edges = doc[0]["data"]["game"]["streams"]["edges"].as<JsonArray>();
+            if (edges.size() > 0) {
+                JsonObject selectedNode;
+                bool streamerFound = false;
+
+                // 1. First priority: look for a live stream with "drop" tag that is NOT in the failed blacklist
+                for (JsonObject edge : edges) {
+                    JsonObject node = edge["node"].as<JsonObject>();
+                    const char* login = node["broadcaster"]["login"] | "";
+                    if (strlen(login) == 0 || isStreamerFailed(login)) continue;
+
+                    JsonArray tags = node["freeformTags"].as<JsonArray>();
+                    for (JsonObject tag : tags) {
+                        const char* tagName = tag["name"] | "";
+                        if (strcasestr(tagName, "drop") != NULL) {
+                            selectedNode = node;
+                            streamerFound = true;
+                            Logger::info("Selected streamer '%s' with Drops Enabled tag ('%s')", login, tagName);
+                            break;
+                        }
+                    }
+                    if (streamerFound) break;
+                }
+
+                // 2. Second priority: pick first stream from category that is NOT blacklisted
+                if (!streamerFound) {
                     for (JsonObject edge : edges) {
                         JsonObject node = edge["node"].as<JsonObject>();
                         const char* login = node["broadcaster"]["login"] | "";
-                        if (strlen(login) == 0 || isStreamerFailed(login)) continue;
-
-                        JsonArray tags = node["freeformTags"].as<JsonArray>();
-                        for (JsonObject tag : tags) {
-                            const char* tagName = tag["name"] | "";
-                            if (strcasestr(tagName, "drop") != NULL) {
-                                selectedNode = node;
-                                streamerFound = true;
-                                Logger::info("Selected streamer '%s' with Drops Enabled tag ('%s')", login, tagName);
-                                break;
-                            }
-                        }
-                        if (streamerFound) break;
-                    }
-
-                    // 2. Second priority: pick first stream from category that is NOT blacklisted
-                    if (!streamerFound) {
-                        for (JsonObject edge : edges) {
-                            JsonObject node = edge["node"].as<JsonObject>();
-                            const char* login = node["broadcaster"]["login"] | "";
-                            if (strlen(login) > 0 && !isStreamerFailed(login)) {
-                                selectedNode = node;
-                                streamerFound = true;
-                                Logger::info("Selected stream for '%s': '%s'", searchGame, login);
-                                break;
-                            }
+                        if (strlen(login) > 0 && !isStreamerFailed(login)) {
+                            selectedNode = node;
+                            streamerFound = true;
+                            Logger::info("Selected stream for '%s': '%s'", searchGame, login);
+                            break;
                         }
                     }
+                }
 
-                    if (streamerFound) {
-                        JsonObject broadcaster = selectedNode["broadcaster"];
-                        const char* login = broadcaster["login"] | "";
-                        const char* channelId = broadcaster["id"] | "";
-                        const char* broadcastId = selectedNode["id"] | "";
+                if (streamerFound) {
+                    JsonObject broadcaster = selectedNode["broadcaster"];
+                    const char* login = broadcaster["login"] | "";
+                    const char* channelId = broadcaster["id"] | "";
+                    const char* broadcastId = selectedNode["id"] | "";
 
-                        snprintf(g_state.current_channel, sizeof(g_state.current_channel), "%s", login);
-                        snprintf(g_state.current_channel_id, sizeof(g_state.current_channel_id), "%s", channelId);
-                        snprintf(g_state.current_broadcast_id, sizeof(g_state.current_broadcast_id), "%s", broadcastId);
+                    snprintf(g_state.current_channel, sizeof(g_state.current_channel), "%s", login);
+                    snprintf(g_state.current_channel_id, sizeof(g_state.current_channel_id), "%s", channelId);
+                    snprintf(g_state.current_broadcast_id, sizeof(g_state.current_broadcast_id), "%s", broadcastId);
 
-                        Logger::info("Found live streamer: %s (Channel ID: %s, Broadcast ID: %s)", login, channelId, broadcastId);
-                        return true;
-                    }
+                    Logger::info("Found Live Streamer for '%s': %s (ID: %s, Broadcast ID: %s)", searchGame, login, channelId, broadcastId);
+                    return true;
                 }
             }
         }
-        Logger::warn("No eligible live streams with Drops found for '%s'. Rotating to next game...", searchGame);
-        // Demote stalled game and switch to next game in queue
-        for (uint8_t qi = 0; qi < g_config.game_queue_count; qi++) {
-            if (strcasecmp(g_config.game_queue[qi].name, searchGame) == 0) {
-                g_config.game_queue[qi].status = GAME_QUEUED;
-                g_config.game_queue[qi].priority += 10;
-                break;
-            }
-        }
-        selectNextGameFromQueue();
-        return false;
     }
 
-    // Lookup channel details & live broadcast ID for target channel if missing
-    if (strlen(g_state.current_channel) > 0 && (strlen(g_state.current_channel_id) == 0 || strlen(g_state.current_broadcast_id) == 0)) {
-        String payload = "[{\"operationName\":\"VideoPlayerStreamInfoOverlayChannel\",\"query\":\"query VideoPlayerStreamInfoOverlayChannel($channel: String!) { user(login: $channel) { id stream { id createdAt type viewersCount } } }\",\"variables\":{\"channel\":\"";
-        payload += g_state.current_channel;
-        payload += "\"}}]";
-
-        String response = sendGraphQLRequest(payload);
-        if (response.length() > 0) {
-            JsonDocument doc;
-            if (!deserializeJson(doc, response)) {
-                JsonObject userObj = doc[0]["data"]["user"];
-                const char* idStr = userObj["id"] | "";
-                const char* bIdStr = userObj["stream"]["id"] | "";
-
-                if (strlen(idStr) > 0) snprintf(g_state.current_channel_id, sizeof(g_state.current_channel_id), "%s", idStr);
-                if (strlen(bIdStr) > 0) snprintf(g_state.current_broadcast_id, sizeof(g_state.current_broadcast_id), "%s", bIdStr);
-
-                Logger::info("Streamer metadata updated: %s (Channel ID: %s, Broadcast ID: %s)", g_state.current_channel, g_state.current_channel_id, g_state.current_broadcast_id);
-                return true;
-            }
+    Logger::warn("No eligible live streams with Drops found for '%s'. Rotating to next game...", searchGame);
+    // Demote stalled game and switch to next game in queue
+    for (uint8_t qi = 0; qi < g_config.game_queue_count; qi++) {
+        if (strcasecmp(g_config.game_queue[qi].name, searchGame) == 0) {
+            g_config.game_queue[qi].status = GAME_QUEUED;
+            g_config.game_queue[qi].priority += 10;
+            break;
         }
     }
-    return strlen(g_state.current_channel_id) > 0;
+    selectNextGameFromQueue();
+    return false;
 }
 
 String TwitchAPI::urlEncode(const String& str) {
@@ -1288,6 +1339,10 @@ bool TwitchAPI::claimDrop(const char* dropInstanceId) {
         if (strcmp(status, "SUCCESS") == 0 || strcmp(status, "FULFILLED") == 0 || 
             strcmp(status, "ELIGIBLE_FOR_ALL") == 0 || strcmp(status, "DROP_INSTANCE_ID") == 0) {
             g_state.drops_claimed_count++;
+            if (g_config.active_account_idx < g_config.account_count) {
+                g_config.accounts[g_config.active_account_idx].drops_claimed++;
+            }
+            LedIndicator::flashClaim();
             Logger::info("🎉 DROP CLAIMED SUCCESSFULLY! Total claimed: %u", g_state.drops_claimed_count);
             snprintf(g_state.status_message, sizeof(g_state.status_message), "Claimed drop! Total: %u", g_state.drops_claimed_count);
             return true;
@@ -1298,6 +1353,90 @@ bool TwitchAPI::claimDrop(const char* dropInstanceId) {
             Logger::warn("Claim response status: '%s'", status[0] ? status : "unknown");
             return false;
         }
+    }
+    return false;
+}
+
+bool TwitchAPI::claimCommunityPoints(const char* channelId, const char* claimId) {
+    if (!channelId || strlen(channelId) == 0 || !claimId || strlen(claimId) == 0) return false;
+
+    Logger::info("🎁 Claiming Twitch Channel Points (Channel: %s, Claim: %s)...", channelId, claimId);
+
+    // Persisted query with fallback
+    String payload = "[{\"operationName\":\"ClaimCommunityPoints\",\"extensions\":{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"46aaeebe02c99afdf4fc97c7c0cba964124bf6b0af229395f1f6d1feed05b3d0\"}},\"variables\":{\"input\":{\"channelID\":\"";
+    payload += channelId;
+    payload += "\",\"claimID\":\"";
+    payload += claimId;
+    payload += "\"}}}]";
+
+    String response = sendGraphQLRequest(payload);
+    if (response.indexOf("claimStatus") == -1 && response.indexOf("pointsEarned") == -1) {
+        // Fallback to inline mutation
+        payload = "[{\"operationName\":\"ClaimCommunityPoints\",\"query\":\"mutation ClaimCommunityPoints($input: ClaimCommunityPointsInput!) { claimCommunityPoints(input: $input) { pointsEarned claimStatus } }\",\"variables\":{\"input\":{\"channelID\":\"";
+        payload += channelId;
+        payload += "\",\"claimID\":\"";
+        payload += claimId;
+        payload += "\"}}}]";
+        response = sendGraphQLRequest(payload);
+    }
+
+    if (response.length() > 0 && response.indexOf("claimCommunityPoints") != -1) {
+        g_state.channel_points_claimed_count++;
+        if (g_config.active_account_idx < g_config.account_count) {
+            g_config.accounts[g_config.active_account_idx].points_claimed++;
+        }
+        LedIndicator::flashClaim();
+        Logger::info("🎉 CHANNEL POINTS CLAIMED! Total collected: %u", g_state.channel_points_claimed_count);
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Account Management
+// ---------------------------------------------------------------------------
+
+bool TwitchAPI::switchAccount(uint8_t accountIdx) {
+    if (accountIdx >= g_config.account_count) return false;
+
+    AccountProfile& acc = g_config.accounts[accountIdx];
+    if (strlen(acc.oauth_token) == 0) return false;
+
+    Logger::info("👤 Switching to Twitch Account [%u]: '%s'...", accountIdx + 1, acc.name);
+
+    disconnectPubSub();
+    g_config.active_account_idx = accountIdx;
+    strncpy(g_config.oauth_token, acc.oauth_token, sizeof(g_config.oauth_token));
+    if (strlen(acc.device_id) > 0) {
+        strncpy(g_state.device_id, acc.device_id, sizeof(g_state.device_id));
+    }
+
+    g_integrity_token[0] = '\0';
+    g_state.user_id[0] = '\0';
+    g_state.user_login[0] = '\0';
+
+    fetchIntegrityToken();
+    if (fetchCurrentUser()) {
+        strncpy(acc.user_id, g_state.user_id, sizeof(acc.user_id));
+        strncpy(acc.user_login, g_state.user_login, sizeof(acc.user_login));
+        connectPubSub();
+        fetchInventoryAndProgress();
+        selectNextGameFromQueue();
+        StorageManager::saveConfig(g_config);
+        return true;
+    }
+    return false;
+}
+
+bool TwitchAPI::rotateNextAccount() {
+    if (g_config.account_count <= 1) return false;
+
+    uint8_t nextIdx = (g_config.active_account_idx + 1) % g_config.account_count;
+    for (uint8_t i = 0; i < g_config.account_count; i++) {
+        if (g_config.accounts[nextIdx].enabled && strlen(g_config.accounts[nextIdx].oauth_token) > 0) {
+            return switchAccount(nextIdx);
+        }
+        nextIdx = (nextIdx + 1) % g_config.account_count;
     }
     return false;
 }
@@ -1331,6 +1470,20 @@ static void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             } else if (msg.indexOf("\"drop-progress\"") != -1 || msg.indexOf("\"drop-claim\"") != -1) {
                 Logger::info("PubSub Drop Event received: %s", msg.c_str());
                 TwitchAPI::fetchInventoryAndProgress();
+            } else if (msg.indexOf("community-points-user-v1") != -1 && msg.indexOf("claim-available") != -1) {
+                Logger::info("PubSub Channel Points event received!");
+                JsonDocument doc;
+                if (!deserializeJson(doc, msg)) {
+                    String innerMsg = doc["data"]["message"].as<String>();
+                    JsonDocument innerDoc;
+                    if (!deserializeJson(innerDoc, innerMsg)) {
+                        const char* claimId = innerDoc["data"]["claim"]["id"] | "";
+                        const char* channelId = innerDoc["data"]["channel_id"] | "";
+                        if (strlen(claimId) > 0 && strlen(channelId) > 0 && g_config.auto_claim_points) {
+                            TwitchAPI::claimCommunityPoints(channelId, claimId);
+                        }
+                    }
+                }
             }
             break;
         }
@@ -1389,6 +1542,13 @@ void TwitchAPI::subscribePubSubTopics() {
         String dropTopic = "user-drop-events.";
         dropTopic += g_state.user_id;
         topics.add(dropTopic);
+    }
+
+    // 3. Subscribe to channel points claiming
+    if (strlen(g_state.user_id) > 0) {
+        String pointsTopic = "community-points-user-v1.";
+        pointsTopic += g_state.user_id;
+        topics.add(pointsTopic);
     }
 
     String jsonStr;
