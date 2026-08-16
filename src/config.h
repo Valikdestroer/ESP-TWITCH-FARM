@@ -14,7 +14,7 @@
 #define DEFAULT_CLIENT_ID "kimne78kx3ncx6brgo4mv6wki5h1ko"
 
 // Priority Game Queue Constants
-#define MAX_PRIORITY_GAMES 8
+#define MAX_PRIORITY_GAMES 32
 #define MAX_PREFERRED_STREAMERS 3
 
 // Multi-Account Constants

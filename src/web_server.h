@@ -22,6 +22,7 @@ private:
     static void handleApiGamesRemove();
     static void handleApiGamesReorder();
     static void handleApiGamesClear();
+    static void handleApiGamesPrune();
     static void handleApiStreamerAdd();
     static void handleApiStreamerRemove();
     static void handleApiAccounts();

@@ -227,10 +227,6 @@ void CLIMenu::handleCommand(const String& cmd) {
     } else if (cmd.startsWith("game add ")) {
         String rest = cmd.substring(9);
         rest.trim();
-        if (g_config.game_queue_count >= MAX_PRIORITY_GAMES) {
-            Serial.printf("Queue full! Maximum %d games allowed.\n", MAX_PRIORITY_GAMES);
-            return;
-        }
         int targetPrio = 0;
         String gameName = rest;
         int lastSpace = rest.lastIndexOf(' ');
@@ -246,6 +242,28 @@ void CLIMenu::handleCommand(const String& cmd) {
             Serial.printf("Game '%s' is already in queue.\n", gameName.c_str());
             return;
         }
+
+        if (g_config.game_queue_count >= MAX_PRIORITY_GAMES) {
+            // Check if we can evict a completed or auto-discovered game
+            int evictIdx = -1;
+            for (int i = g_config.game_queue_count - 1; i >= 0; i--) {
+                if (g_config.game_queue[i].status == GAME_COMPLETED || g_config.game_queue[i].status == GAME_AUTO_DISCOVERED) {
+                    evictIdx = i;
+                    break;
+                }
+            }
+            if (evictIdx >= 0) {
+                Logger::info("Queue full: Evicting low-priority/completed '%s' to make room for '%s'", g_config.game_queue[evictIdx].name, gameName.c_str());
+                for (uint8_t i = evictIdx; i < g_config.game_queue_count - 1; i++) {
+                    g_config.game_queue[i] = g_config.game_queue[i + 1];
+                }
+                g_config.game_queue_count--;
+            } else {
+                Serial.printf("Queue full! Maximum %d active user games allowed.\n", MAX_PRIORITY_GAMES);
+                return;
+            }
+        }
+
         GameEntry& entry = g_config.game_queue[g_config.game_queue_count];
         strncpy(entry.name, gameName.c_str(), sizeof(entry.name) - 1);
         entry.name[sizeof(entry.name) - 1] = '\0';
@@ -258,6 +276,22 @@ void CLIMenu::handleCommand(const String& cmd) {
         StorageManager::saveConfig(g_config);
         Logger::info("Added '%s' to game queue (Priority #%d)", gameName.c_str(), entry.priority);
         TwitchAPI::selectNextGameFromQueue();
+    } else if (cmd == "game prune" || cmd == "game clean") {
+        uint8_t removed = 0;
+        for (int i = g_config.game_queue_count - 1; i >= 0; i--) {
+            if (g_config.game_queue[i].status == GAME_COMPLETED || g_config.game_queue[i].status == GAME_AUTO_DISCOVERED) {
+                for (uint8_t j = i; j < g_config.game_queue_count - 1; j++) {
+                    g_config.game_queue[j] = g_config.game_queue[j + 1];
+                }
+                g_config.game_queue_count--;
+                removed++;
+            }
+        }
+        for (uint8_t i = 0; i < g_config.game_queue_count; i++) {
+            g_config.game_queue[i].priority = i + 1;
+        }
+        StorageManager::saveConfig(g_config);
+        Logger::info("Pruned %u completed/auto-discovered games from queue. %u active games remain.", removed, g_config.game_queue_count);
     } else if (cmd.startsWith("game remove ")) {
         String gameName = cmd.substring(12);
         gameName.trim();

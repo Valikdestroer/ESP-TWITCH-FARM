@@ -206,6 +206,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             <h2>
                 <span>Priority Game Queue</span>
                 <span style="display: flex; gap: 6px;">
+                    <button class="btn btn-sm btn-secondary" onclick="pruneGames()">Prune Finished</button>
                     <button class="btn btn-sm btn-secondary" onclick="clearQueue()">Clear Queue</button>
                     <button class="btn btn-sm btn-secondary" onclick="fetchGames()">Refresh</button>
                 </span>
@@ -471,6 +472,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             fetchGames();
         }
 
+        async function pruneGames() {
+            await fetch('/api/games/prune', { method: 'POST' });
+            fetchGames();
+        }
+
         async function fetchLogs() {
             try {
                 const res = await fetch('/api/logs');
@@ -599,6 +605,7 @@ void WebServerManager::init() {
     server.on("/api/games/remove", HTTP_POST, handleApiGamesRemove);
     server.on("/api/games/reorder", HTTP_POST, handleApiGamesReorder);
     server.on("/api/games/clear", HTTP_POST, handleApiGamesClear);
+    server.on("/api/games/prune", HTTP_POST, handleApiGamesPrune);
 
     // Preferred Streamers API
     server.on("/api/streamers/add", HTTP_POST, handleApiStreamerAdd);
@@ -971,13 +978,28 @@ void WebServerManager::handleApiGamesAdd() {
         server.send(400, "application/json", "{\"error\":\"Game name required\"}");
         return;
     }
-    if (g_config.game_queue_count >= MAX_PRIORITY_GAMES) {
-        server.send(400, "application/json", "{\"error\":\"Queue full (max 8)\"}");
-        return;
-    }
     for (uint8_t i = 0; i < g_config.game_queue_count; i++) {
         if (strcasestr(g_config.game_queue[i].name, name) != NULL) {
             server.send(400, "application/json", "{\"error\":\"Game already in queue\"}");
+            return;
+        }
+    }
+    if (g_config.game_queue_count >= MAX_PRIORITY_GAMES) {
+        // Smart eviction: remove lowest priority completed or auto-discovered game
+        int evictIdx = -1;
+        for (int i = g_config.game_queue_count - 1; i >= 0; i--) {
+            if (g_config.game_queue[i].status == GAME_COMPLETED || g_config.game_queue[i].status == GAME_AUTO_DISCOVERED) {
+                evictIdx = i;
+                break;
+            }
+        }
+        if (evictIdx >= 0) {
+            for (uint8_t i = evictIdx; i < g_config.game_queue_count - 1; i++) {
+                g_config.game_queue[i] = g_config.game_queue[i + 1];
+            }
+            g_config.game_queue_count--;
+        } else {
+            server.send(400, "application/json", "{\"error\":\"Queue full (max 32 active games)\"}");
             return;
         }
     }
@@ -993,6 +1015,24 @@ void WebServerManager::handleApiGamesAdd() {
     StorageManager::saveConfig(g_config);
     TwitchAPI::selectNextGameFromQueue();
     server.send(200, "application/json", "{\"status\":\"added\"}");
+}
+
+void WebServerManager::handleApiGamesPrune() {
+    uint8_t removed = 0;
+    for (int i = g_config.game_queue_count - 1; i >= 0; i--) {
+        if (g_config.game_queue[i].status == GAME_COMPLETED || g_config.game_queue[i].status == GAME_AUTO_DISCOVERED) {
+            for (uint8_t j = i; j < g_config.game_queue_count - 1; j++) {
+                g_config.game_queue[j] = g_config.game_queue[j + 1];
+            }
+            g_config.game_queue_count--;
+            removed++;
+        }
+    }
+    for (uint8_t i = 0; i < g_config.game_queue_count; i++) {
+        g_config.game_queue[i].priority = i + 1;
+    }
+    StorageManager::saveConfig(g_config);
+    server.send(200, "application/json", "{\"status\":\"pruned\"}");
 }
 
 void WebServerManager::handleApiGamesRemove() {
